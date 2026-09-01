@@ -20,6 +20,7 @@ import (
 type api_config struct {
 	file_server_hits atomic.Uint32
 	db               *database.Queries
+	platform         string
 }
 
 type user struct {
@@ -27,6 +28,15 @@ type user struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	Password  string    `json:"-"`
+}
+
+type chirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserId    uuid.UUID `json:"user_id"`
 }
 
 func (config *api_config) middle_ware_increment(next http.Handler) http.Handler {
@@ -43,24 +53,47 @@ func (config *api_config) metrics_handler(writer http.ResponseWriter, request *h
 }
 
 func (config *api_config) reset_handler(writer http.ResponseWriter, request *http.Request) {
+	if config.platform != "dev" {
+		writer.WriteHeader(http.StatusForbidden)
+		writer.Write([]byte("Reset is only allowed in Dev environments"))
+		return
+	}
+	config.file_server_hits.Swap(0)
+	err := config.db.ResetTable(request.Context())
+	if err != nil {
+		writer.WriteHeader(http.StatusInternalServerError)
+		writer.Write([]byte("Table couldn't be reset" + err.Error()))
+		return
+	}
 	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	writer.WriteHeader(http.StatusOK)
-	writer.Write([]byte("Reset visit counter to 0"))
-	config.file_server_hits.Swap(0)
+	writer.Write([]byte("All users deleted and hits set to 0"))
 }
 
 func (config *api_config) new_user_handler(writer http.ResponseWriter, request *http.Request) {
-	type email struct {
-		Email string `json:"email"`
+	type new_user_input struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
 	}
 
 	decoder := json.NewDecoder(request.Body)
-	new_user_email := email{}
-	err := decoder.Decode(&new_user_email)
+	new_user := new_user_input{}
+	err := decoder.Decode(&new_user)
 	if err != nil {
-		respond_with_error(writer, 500, "Couldn't decode email", err)
+		respond_with_error(writer, http.StatusInternalServerError, "Couldn't decode email or password", err)
+		return
 	}
-	new_user_database, err := config.db.CreateUser(request.Context(), new_user_email.Email)
+
+	hashed_password, err := hash_password(new_user.Password)
+	if err != nil {
+		respond_with_error(writer, http.StatusInternalServerError, "Coulnd't hash password", err)
+	}
+
+	new_user_database, err := config.db.CreateUser(request.Context(), database.CreateUserParams{Email: new_user.Email, HashedPassword: hashed_password})
+	if err != nil {
+		respond_with_error(writer, http.StatusInternalServerError, "Couldn't Create user", err)
+		return
+	}
 
 	new_user_native := user{
 		ID:        new_user_database.ID,
@@ -70,6 +103,118 @@ func (config *api_config) new_user_handler(writer http.ResponseWriter, request *
 	}
 
 	respond_with_json(writer, 201, new_user_native)
+}
+
+// validateing a chirp and adding it to the database
+func (config *api_config) new_chirp_handler(writer http.ResponseWriter, request *http.Request) {
+	type new_chirp_native struct {
+		Body    string    `json:"body"`
+		User_id uuid.UUID `json:"user_id"`
+	}
+
+	decoder := json.NewDecoder(request.Body)
+	chirp_instance := new_chirp_native{}
+	err := decoder.Decode(&chirp_instance)
+	if err != nil {
+		respond_with_error(writer, http.StatusInternalServerError, "Couldn't decode chirp", err)
+		return
+	}
+	if len(chirp_instance.Body) > 140 {
+		respond_with_error(writer, http.StatusBadRequest, "Chirp is too long", nil)
+		return
+	}
+	chirp_instance.Body = censor_profane_words(chirp_instance.Body)
+	new_chirp_database, err := config.db.CreateChirp(request.Context(), database.CreateChirpParams{Body: chirp_instance.Body, UserID: chirp_instance.User_id})
+	if err != nil {
+		respond_with_error(writer, http.StatusInternalServerError, "Couldn't add chirp to database", err)
+		return
+	}
+	chirp_native := chirp{
+		ID:        new_chirp_database.ID,
+		CreatedAt: new_chirp_database.CreatedAt,
+		UpdatedAt: new_chirp_database.UpdatedAt,
+		Body:      new_chirp_database.Body,
+		UserId:    new_chirp_database.UserID,
+	}
+
+	respond_with_json(writer, 201, chirp_native)
+}
+
+func (config *api_config) get_all_chirps_handler(writer http.ResponseWriter, request *http.Request) {
+
+	all_users, err := config.db.GetChirps(request.Context())
+	if err != nil {
+		respond_with_error(writer, http.StatusInternalServerError, "Couldn't get chirps from the server", err)
+	}
+	native_chirps := make([]chirp, 0, len(all_users))
+
+	for _, db_chirp := range all_users {
+		native_chirps = append(native_chirps, chirp{
+			ID:        db_chirp.ID,
+			CreatedAt: db_chirp.CreatedAt,
+			UpdatedAt: db_chirp.UpdatedAt,
+			Body:      db_chirp.Body,
+			UserId:    db_chirp.UserID,
+		})
+	}
+	respond_with_json(writer, http.StatusOK, native_chirps)
+}
+
+func (config *api_config) get_chirp_handler(writer http.ResponseWriter, request *http.Request) {
+	id, err := uuid.Parse(request.PathValue("chirpID"))
+	if err != nil {
+		respond_with_error(writer, 500, "Invalid UUID", err)
+		return
+	}
+
+	recieved_chirp, err := config.db.GetChirp(request.Context(), id)
+	if err != nil {
+		respond_with_error(writer, 404, "chirp not found", err)
+		return
+	}
+	respond_with_json(writer, http.StatusOK, chirp{
+		ID:        recieved_chirp.ID,
+		CreatedAt: recieved_chirp.CreatedAt,
+		UpdatedAt: recieved_chirp.UpdatedAt,
+		Body:      recieved_chirp.Body,
+		UserId:    recieved_chirp.UserID,
+	})
+}
+
+func (config *api_config) login_handler(writer http.ResponseWriter, request *http.Request) {
+	type client_user_info struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+
+	decoder := json.NewDecoder(request.Body)
+	login_user := client_user_info{}
+	err := decoder.Decode(&login_user)
+	if err != nil {
+		respond_with_error(writer, http.StatusBadRequest, "Not valid user information", err)
+		return
+	}
+
+	user_info, err := config.db.GetUser(request.Context(), login_user.Email)
+	if err != nil {
+		respond_with_error(writer, 401, "Incorrect email or password", err)
+		return
+	}
+	passwords_match, err := check_password_hash(login_user.Password, user_info.HashedPassword)
+	if err != nil || !passwords_match {
+		respond_with_error(writer, 401, "Incorrect email or password", err)
+		return
+	}
+
+	user_no_pass := user{
+		ID:        user_info.ID,
+		CreatedAt: user_info.CreatedAt,
+		UpdatedAt: user_info.UpdatedAt,
+		Email:     user_info.Email,
+	}
+
+	respond_with_json(writer, http.StatusOK, user_no_pass)
+
 }
 
 func respond_with_error(writer http.ResponseWriter, code int, msg string, err error) {
@@ -106,15 +251,23 @@ func main() {
 		log.Fatalf("Error opening database %s", err)
 	}
 	db_queries := database.New(db_connection)
+	platform := os.Getenv("PLATFORM")
+	if platform == "" {
+		log.Fatal("PLATFORM must be set")
+	}
 	api_config := api_config{
 		file_server_hits: atomic.Uint32{},
 		db:               db_queries,
+		platform:         platform,
 	}
 	handler := http.NewServeMux()
 	handler.Handle("/app/", api_config.middle_ware_increment(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))
 	handler.HandleFunc("GET /api/healthz", healthHandler)
-	handler.HandleFunc("POST /api/validate_chirp", validate_handler)
+	handler.HandleFunc("GET /api/chirps", api_config.get_all_chirps_handler)
+	handler.HandleFunc("GET /api/chirps/{chirpID}", api_config.get_chirp_handler)
+	handler.HandleFunc("POST /api/chirps", api_config.new_chirp_handler)
 	handler.HandleFunc("POST /api/users", api_config.new_user_handler)
+	handler.HandleFunc("POST /api/login", api_config.login_handler)
 	handler.HandleFunc("GET /admin/metrics", api_config.metrics_handler)
 	handler.HandleFunc("POST /admin/reset", api_config.reset_handler)
 	server := &http.Server{
@@ -140,32 +293,6 @@ func censor_profane_words(body string) string {
 		}
 	}
 	return strings.Join(body_lower_case_split, " ")
-}
-
-// validateing that the body isn't longer than 140 characters
-func validate_handler(writer http.ResponseWriter, request *http.Request) {
-	type chirp struct {
-		Body string `json:"body"`
-	}
-
-	type cleaned_chirp struct {
-		Cleaned_Body string `json:"cleaned_body"`
-	}
-
-	decoder := json.NewDecoder(request.Body)
-	chirp_instance := chirp{}
-	err := decoder.Decode(&chirp_instance)
-	if err != nil {
-		respond_with_error(writer, http.StatusInternalServerError, "Couldn't decode chirp", err)
-		return
-	}
-	if len(chirp_instance.Body) > 140 {
-		respond_with_error(writer, http.StatusBadRequest, "Chirp is too long", nil)
-		return
-	}
-	cleaned_chirp_instance := censor_profane_words(chirp_instance.Body)
-
-	respond_with_json(writer, http.StatusOK, cleaned_chirp{Cleaned_Body: cleaned_chirp_instance})
 }
 
 func healthHandler(writer http.ResponseWriter, request *http.Request) {
