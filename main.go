@@ -21,6 +21,7 @@ type api_config struct {
 	file_server_hits atomic.Uint32
 	db               *database.Queries
 	platform         string
+	secret           string
 }
 
 type user struct {
@@ -29,6 +30,7 @@ type user struct {
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
 	Password  string    `json:"-"`
+	Token     string    `json:"token"`
 }
 
 type chirp struct {
@@ -108,13 +110,24 @@ func (config *api_config) new_user_handler(writer http.ResponseWriter, request *
 // validateing a chirp and adding it to the database
 func (config *api_config) new_chirp_handler(writer http.ResponseWriter, request *http.Request) {
 	type new_chirp_native struct {
-		Body    string    `json:"body"`
-		User_id uuid.UUID `json:"user_id"`
+		Body string `json:"body"`
+	}
+
+	jwt_token, err := get_bearer_token(request.Header)
+	if err != nil {
+		respond_with_error(writer, http.StatusBadRequest, "header formatted wrong", err)
+		return
+	}
+
+	user_id, err := validate_jwt(jwt_token, config.secret)
+	if err != nil {
+		respond_with_error(writer, 401, "Unauthorized", err)
+		return
 	}
 
 	decoder := json.NewDecoder(request.Body)
 	chirp_instance := new_chirp_native{}
-	err := decoder.Decode(&chirp_instance)
+	err = decoder.Decode(&chirp_instance)
 	if err != nil {
 		respond_with_error(writer, http.StatusInternalServerError, "Couldn't decode chirp", err)
 		return
@@ -124,7 +137,7 @@ func (config *api_config) new_chirp_handler(writer http.ResponseWriter, request 
 		return
 	}
 	chirp_instance.Body = censor_profane_words(chirp_instance.Body)
-	new_chirp_database, err := config.db.CreateChirp(request.Context(), database.CreateChirpParams{Body: chirp_instance.Body, UserID: chirp_instance.User_id})
+	new_chirp_database, err := config.db.CreateChirp(request.Context(), database.CreateChirpParams{Body: chirp_instance.Body, UserID: user_id})
 	if err != nil {
 		respond_with_error(writer, http.StatusInternalServerError, "Couldn't add chirp to database", err)
 		return
@@ -183,8 +196,9 @@ func (config *api_config) get_chirp_handler(writer http.ResponseWriter, request 
 
 func (config *api_config) login_handler(writer http.ResponseWriter, request *http.Request) {
 	type client_user_info struct {
-		Password string `json:"password"`
-		Email    string `json:"email"`
+		Password         string `json:"password"`
+		Email            string `json:"email"`
+		ExpiresInSeconds *int   `json:"expires_in_seconds,omitempty"`
 	}
 
 	decoder := json.NewDecoder(request.Body)
@@ -193,6 +207,15 @@ func (config *api_config) login_handler(writer http.ResponseWriter, request *htt
 	if err != nil {
 		respond_with_error(writer, http.StatusBadRequest, "Not valid user information", err)
 		return
+	}
+
+	if login_user.ExpiresInSeconds == nil {
+		var expire_pointer *int
+		expire_pointer = new(int)
+		*expire_pointer = 3600
+		login_user.ExpiresInSeconds = expire_pointer
+	} else if *login_user.ExpiresInSeconds > 3600 {
+		*login_user.ExpiresInSeconds = 3600
 	}
 
 	user_info, err := config.db.GetUser(request.Context(), login_user.Email)
@@ -206,11 +229,17 @@ func (config *api_config) login_handler(writer http.ResponseWriter, request *htt
 		return
 	}
 
+	user_token, err := make_jwt(user_info.ID, config.secret, time.Duration(*login_user.ExpiresInSeconds*int(time.Second)))
+	if err != nil {
+		respond_with_error(writer, http.StatusInternalServerError, "Couldn't make jwt", err)
+	}
+
 	user_no_pass := user{
 		ID:        user_info.ID,
 		CreatedAt: user_info.CreatedAt,
 		UpdatedAt: user_info.UpdatedAt,
 		Email:     user_info.Email,
+		Token:     user_token,
 	}
 
 	respond_with_json(writer, http.StatusOK, user_no_pass)
@@ -246,6 +275,11 @@ func main() {
 	if dbURL == "" {
 		log.Fatal("DB_URL must be set")
 	}
+	server_secret := os.Getenv("SECRET")
+	if server_secret == "" {
+		log.Fatal("Server must have a secret for encryption")
+	}
+
 	db_connection, err := sql.Open("postgres", dbURL)
 	if err != nil {
 		log.Fatalf("Error opening database %s", err)
@@ -259,6 +293,7 @@ func main() {
 		file_server_hits: atomic.Uint32{},
 		db:               db_queries,
 		platform:         platform,
+		secret:           server_secret,
 	}
 	handler := http.NewServeMux()
 	handler.Handle("/app/", api_config.middle_ware_increment(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))
