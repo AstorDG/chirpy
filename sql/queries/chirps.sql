@@ -9,8 +9,13 @@ VALUES (
 )
 RETURNING *;
 
--- name: GetChirps :many
+-- name: GetAllChirps :many
 SELECT * from chirps
+ORDER BY created_at ASC;
+
+-- name: GetChirpsByAuthor :many
+SELECT * from chirps
+WHERE $1 = user_id
 ORDER BY created_at ASC;
 
 -- name: GetChirp :one

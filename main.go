@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -22,6 +23,7 @@ type api_config struct {
 	db               *database.Queries
 	platform         string
 	secret           string
+	polka_key        string
 }
 
 type user struct {
@@ -218,21 +220,58 @@ func (config *api_config) new_chirp_handler(writer http.ResponseWriter, request 
 
 func (config *api_config) get_all_chirps_handler(writer http.ResponseWriter, request *http.Request) {
 
-	all_users, err := config.db.GetChirps(request.Context())
-	if err != nil {
-		respond_with_error(writer, http.StatusInternalServerError, "Couldn't get chirps from the server", err)
-	}
-	native_chirps := make([]chirp, 0, len(all_users))
+	author_query_parameter := request.URL.Query().Get("author_id")
+	sort_qurey_parameter := request.URL.Query().Get("sort")
 
-	for _, db_chirp := range all_users {
-		native_chirps = append(native_chirps, chirp{
-			ID:        db_chirp.ID,
-			CreatedAt: db_chirp.CreatedAt,
-			UpdatedAt: db_chirp.UpdatedAt,
-			Body:      db_chirp.Body,
-			UserId:    db_chirp.UserID,
-		})
+	if sort_qurey_parameter != "" && sort_qurey_parameter != "asc" && sort_qurey_parameter != "desc" {
+		respond_with_error(writer, http.StatusBadRequest, "invalid sort argument", nil)
+		return
 	}
+
+	var recieved_chirps []database.Chirp
+	var err error
+
+	if author_query_parameter == "" {
+		recieved_chirps, err = config.db.GetAllChirps(request.Context())
+		if err != nil {
+			respond_with_error(writer, http.StatusInternalServerError, "Couldn't get chirps from the server", err)
+		}
+	} else {
+		author_id, err := uuid.Parse(author_query_parameter)
+		if err != nil {
+			respond_with_error(writer, http.StatusBadRequest, "invalid author id", err)
+			return
+		}
+		recieved_chirps, err = config.db.GetChirpsByAuthor(request.Context(), author_id)
+		if err != nil {
+			respond_with_error(writer, http.StatusBadRequest, "Invalid author id", err)
+		}
+	}
+
+	native_chirps := make([]chirp, 0, len(recieved_chirps))
+
+	if sort_qurey_parameter == "desc" {
+		for _, db_chirp := range slices.Backward(recieved_chirps) {
+			native_chirps = append(native_chirps, chirp{
+				ID:        db_chirp.ID,
+				CreatedAt: db_chirp.CreatedAt,
+				UpdatedAt: db_chirp.UpdatedAt,
+				Body:      db_chirp.Body,
+				UserId:    db_chirp.UserID,
+			})
+		}
+	} else {
+		for _, db_chirp := range recieved_chirps {
+			native_chirps = append(native_chirps, chirp{
+				ID:        db_chirp.ID,
+				CreatedAt: db_chirp.CreatedAt,
+				UpdatedAt: db_chirp.UpdatedAt,
+				Body:      db_chirp.Body,
+				UserId:    db_chirp.UserID,
+			})
+		}
+	}
+
 	respond_with_json(writer, http.StatusOK, native_chirps)
 }
 
@@ -291,7 +330,6 @@ func (config *api_config) delete_chirp_handler(writer http.ResponseWriter, reque
 	}
 
 	writer.WriteHeader(204)
-	return
 }
 
 func (config *api_config) login_handler(writer http.ResponseWriter, request *http.Request) {
@@ -414,9 +452,20 @@ func (config *api_config) upgrade_user_handler(writer http.ResponseWriter, reque
 		Data  user_id `json:"data"`
 	}
 
+	api_key, err := get_api_key(request.Header)
+	if err != nil {
+		respond_with_error(writer, 401, "Malphormed header", nil)
+		return
+	}
+
+	if config.polka_key != api_key {
+		respond_with_error(writer, 401, "invalid api key", nil)
+		return
+	}
+
 	decoder := json.NewDecoder(request.Body)
 	this_upgrade_request := upgrade_request{}
-	err := decoder.Decode(&this_upgrade_request)
+	err = decoder.Decode(&this_upgrade_request)
 	if err != nil {
 		respond_with_error(writer, http.StatusBadRequest, "malformed request", err)
 		return
@@ -477,6 +526,7 @@ func main() {
 	if server_secret == "" {
 		log.Fatal("Server must have a secret for encryption")
 	}
+	polka_key := os.Getenv("POLKA_KEY")
 
 	db_connection, err := sql.Open("postgres", dbURL)
 	if err != nil {
@@ -492,6 +542,7 @@ func main() {
 		db:               db_queries,
 		platform:         platform,
 		secret:           server_secret,
+		polka_key:        polka_key,
 	}
 	handler := http.NewServeMux()
 	handler.Handle("/app/", api_config.middle_ware_increment(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))

@@ -90,3 +90,13 @@ func make_refresh_token() string {
 	rand.Read(rand_bytes)
 	return hex.EncodeToString(rand_bytes)
 }
+
+func get_api_key(headers http.Header) (string, error) {
+	api_key := headers.Get("Authorization")
+	if api_key == "" {
+		return "", errors.New("No authorization header")
+	}
+	split_token := strings.Split(api_key, " ")
+	return split_token[1], nil
+
+}
