@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"log"
 	"net/http"
@@ -81,4 +83,10 @@ func get_bearer_token(headers http.Header) (string, error) {
 	}
 	split_token := strings.Split(token, " ")
 	return split_token[1], nil
+}
+
+func make_refresh_token() string {
+	rand_bytes := make([]byte, 32)
+	rand.Read(rand_bytes)
+	return hex.EncodeToString(rand_bytes)
 }

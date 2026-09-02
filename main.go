@@ -196,9 +196,8 @@ func (config *api_config) get_chirp_handler(writer http.ResponseWriter, request 
 
 func (config *api_config) login_handler(writer http.ResponseWriter, request *http.Request) {
 	type client_user_info struct {
-		Password         string `json:"password"`
-		Email            string `json:"email"`
-		ExpiresInSeconds *int   `json:"expires_in_seconds,omitempty"`
+		Password string `json:"password"`
+		Email    string `json:"email"`
 	}
 
 	decoder := json.NewDecoder(request.Body)
@@ -207,15 +206,6 @@ func (config *api_config) login_handler(writer http.ResponseWriter, request *htt
 	if err != nil {
 		respond_with_error(writer, http.StatusBadRequest, "Not valid user information", err)
 		return
-	}
-
-	if login_user.ExpiresInSeconds == nil {
-		var expire_pointer *int
-		expire_pointer = new(int)
-		*expire_pointer = 3600
-		login_user.ExpiresInSeconds = expire_pointer
-	} else if *login_user.ExpiresInSeconds > 3600 {
-		*login_user.ExpiresInSeconds = 3600
 	}
 
 	user_info, err := config.db.GetUser(request.Context(), login_user.Email)
@@ -229,21 +219,88 @@ func (config *api_config) login_handler(writer http.ResponseWriter, request *htt
 		return
 	}
 
-	user_token, err := make_jwt(user_info.ID, config.secret, time.Duration(*login_user.ExpiresInSeconds*int(time.Second)))
+	access_token, err := make_jwt(user_info.ID, config.secret, time.Duration(int(time.Hour)))
 	if err != nil {
 		respond_with_error(writer, http.StatusInternalServerError, "Couldn't make jwt", err)
+		return
+	}
+	refresh_token := make_refresh_token()
+
+	_, err = config.db.CreateRefreshToken(request.Context(), database.CreateRefreshTokenParams{
+		Token:     refresh_token,
+		UserID:    user_info.ID,
+		ExpiresAt: time.Now().Add(time.Hour * 24 * 60)})
+	if err != nil {
+		respond_with_error(writer, http.StatusInternalServerError, "Database coulnd't create a refresh token", err)
+		return
 	}
 
-	user_no_pass := user{
-		ID:        user_info.ID,
-		CreatedAt: user_info.CreatedAt,
-		UpdatedAt: user_info.UpdatedAt,
-		Email:     user_info.Email,
-		Token:     user_token,
+	type user_token struct {
+		ID            uuid.UUID `json:"id"`
+		CreatedAt     time.Time `json:"created_at"`
+		UpdatedAt     time.Time `json:"updated_at"`
+		Email         string    `json:"email"`
+		Token         string    `json:"token"`
+		Refresh_token string    `json:"refresh_token"`
+	}
+
+	user_no_pass := user_token{
+		ID:            user_info.ID,
+		CreatedAt:     user_info.CreatedAt,
+		UpdatedAt:     user_info.UpdatedAt,
+		Email:         user_info.Email,
+		Token:         access_token,
+		Refresh_token: refresh_token,
 	}
 
 	respond_with_json(writer, http.StatusOK, user_no_pass)
+}
 
+func (config *api_config) refresh_handler(writer http.ResponseWriter, request *http.Request) {
+	refresh_token, err := get_bearer_token(request.Header)
+	if err != nil {
+		respond_with_error(writer, http.StatusBadRequest, "Refresh token doesn't exist", err)
+		return
+	}
+	db_refresh_token, err := config.db.GetRefreshToken(request.Context(), refresh_token)
+	if err != nil {
+		respond_with_error(writer, 401, "Invalid Token", err)
+		return
+	} else if db_refresh_token.RevokedAt.Valid == true {
+		respond_with_error(writer, 401, "token revoked", nil)
+		return
+	} else if time.Now().After(db_refresh_token.ExpiresAt) {
+		respond_with_error(writer, 401, "token expired", nil)
+		return
+	}
+
+	type response struct {
+		Token string `json:"token"`
+	}
+
+	access_token, err := make_jwt(db_refresh_token.UserID, config.secret, time.Hour)
+
+	if err != nil {
+		respond_with_error(writer, http.StatusInternalServerError, "error creating access token", err)
+		return
+	}
+
+	respond_with_json(writer, 200, response{Token: access_token})
+}
+func (config *api_config) revoke_handler(writer http.ResponseWriter, request *http.Request) {
+	refresh_token, err := get_bearer_token(request.Header)
+	if err != nil {
+		respond_with_error(writer, http.StatusBadRequest, "Refresh token required", err)
+		return
+	}
+
+	err = config.db.RevokeToken(request.Context(), database.RevokeTokenParams{RevokedAt: sql.NullTime{Time: time.Now(), Valid: true}, Token: refresh_token})
+	if err != nil {
+		respond_with_error(writer, http.StatusBadRequest, "Invalid refresh token", err)
+		return
+	}
+
+	writer.WriteHeader(204)
 }
 
 func respond_with_error(writer http.ResponseWriter, code int, msg string, err error) {
@@ -303,6 +360,8 @@ func main() {
 	handler.HandleFunc("POST /api/chirps", api_config.new_chirp_handler)
 	handler.HandleFunc("POST /api/users", api_config.new_user_handler)
 	handler.HandleFunc("POST /api/login", api_config.login_handler)
+	handler.HandleFunc("POST /api/refresh", api_config.refresh_handler)
+	handler.HandleFunc("POST /api/revoke", api_config.revoke_handler)
 	handler.HandleFunc("GET /admin/metrics", api_config.metrics_handler)
 	handler.HandleFunc("POST /admin/reset", api_config.reset_handler)
 	server := &http.Server{
