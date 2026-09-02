@@ -97,14 +97,77 @@ func (config *api_config) new_user_handler(writer http.ResponseWriter, request *
 		return
 	}
 
+	type user struct {
+		ID          uuid.UUID `json:"id"`
+		CreatedAt   time.Time `json:"created_at"`
+		UpdatedAt   time.Time `json:"updated_at"`
+		Email       string    `json:"email"`
+		IsChirpyRed bool      `json:"is_chirpy_red"`
+	}
 	new_user_native := user{
-		ID:        new_user_database.ID,
-		CreatedAt: new_user_database.CreatedAt,
-		UpdatedAt: new_user_database.UpdatedAt,
-		Email:     new_user_database.Email,
+		ID:          new_user_database.ID,
+		CreatedAt:   new_user_database.CreatedAt,
+		UpdatedAt:   new_user_database.UpdatedAt,
+		Email:       new_user_database.Email,
+		IsChirpyRed: new_user_database.IsChirpyRed,
 	}
 
 	respond_with_json(writer, 201, new_user_native)
+}
+
+func (config *api_config) update_user_info_handler(writer http.ResponseWriter, request *http.Request) {
+	access_token, err := get_bearer_token(request.Header)
+	if err != nil {
+		respond_with_error(writer, 401, "Invalid Token", err)
+		return
+	}
+
+	user_id, err := validate_jwt(access_token, config.secret)
+	if err != nil {
+		respond_with_error(writer, 401, "invalid access token", err)
+		return
+	}
+
+	type updated_user_input struct {
+		Password string `json:"password"`
+		Email    string `json:"email"`
+	}
+
+	decoder := json.NewDecoder(request.Body)
+	updated_user_input_instance := updated_user_input{}
+	err = decoder.Decode(&updated_user_input_instance)
+	if err != nil {
+		respond_with_error(writer, http.StatusBadRequest, "error decoding json", err)
+		return
+	}
+
+	hashed_password, err := hash_password(updated_user_input_instance.Password)
+	if err != nil {
+		respond_with_error(writer, http.StatusInternalServerError, "Error hashing password", err)
+		return
+	}
+
+	updated_user_database, err := config.db.UpdateUser(request.Context(), database.UpdateUserParams{Email: updated_user_input_instance.Email, HashedPassword: hashed_password, ID: user_id})
+	if err != nil {
+		respond_with_error(writer, http.StatusInternalServerError, "error updating user", err)
+		return
+	}
+
+	type user struct {
+		ID          uuid.UUID `json:"id"`
+		CreatedAt   time.Time `json:"created_at"`
+		UpdatedAt   time.Time `json:"updated_at"`
+		Email       string    `json:"email"`
+		IsChirpyRed bool      `json:"is_chirpy_red"`
+	}
+	new_user_native := user{
+		ID:          updated_user_database.ID,
+		CreatedAt:   updated_user_database.CreatedAt,
+		UpdatedAt:   updated_user_database.UpdatedAt,
+		Email:       updated_user_database.Email,
+		IsChirpyRed: updated_user_database.IsChirpyRed,
+	}
+	respond_with_json(writer, http.StatusOK, new_user_native)
 }
 
 // validateing a chirp and adding it to the database
@@ -193,6 +256,43 @@ func (config *api_config) get_chirp_handler(writer http.ResponseWriter, request 
 		UserId:    recieved_chirp.UserID,
 	})
 }
+func (config *api_config) delete_chirp_handler(writer http.ResponseWriter, request *http.Request) {
+	access_token, err := get_bearer_token(request.Header)
+	if err != nil {
+		respond_with_error(writer, 401, "malformed token", err)
+		return
+	}
+
+	user_id, err := validate_jwt(access_token, config.secret)
+	if err != nil {
+		respond_with_error(writer, 403, "invalid token", err)
+		return
+	}
+
+	chirp_id, err := uuid.Parse(request.PathValue("chirpID"))
+	if err != nil {
+		respond_with_error(writer, 500, "not a valid chirp id", err)
+		return
+	}
+	db_chirp, err := config.db.GetChirp(request.Context(), chirp_id)
+	if err != nil {
+		respond_with_error(writer, http.StatusNotFound, "Coulnd't get chirp with that id", err)
+		return
+	}
+	if db_chirp.UserID != user_id {
+		respond_with_error(writer, 403, "User did not write that chirp", nil)
+		return
+	}
+
+	err = config.db.DeleteChirp(request.Context(), chirp_id)
+	if err != nil {
+		respond_with_error(writer, http.StatusInternalServerError, "Couldn't delete chirp", err)
+		return
+	}
+
+	writer.WriteHeader(204)
+	return
+}
 
 func (config *api_config) login_handler(writer http.ResponseWriter, request *http.Request) {
 	type client_user_info struct {
@@ -208,7 +308,7 @@ func (config *api_config) login_handler(writer http.ResponseWriter, request *htt
 		return
 	}
 
-	user_info, err := config.db.GetUser(request.Context(), login_user.Email)
+	user_info, err := config.db.GetUserByEmail(request.Context(), login_user.Email)
 	if err != nil {
 		respond_with_error(writer, 401, "Incorrect email or password", err)
 		return
@@ -242,6 +342,7 @@ func (config *api_config) login_handler(writer http.ResponseWriter, request *htt
 		Email         string    `json:"email"`
 		Token         string    `json:"token"`
 		Refresh_token string    `json:"refresh_token"`
+		IsChirpyRed   bool      `json:"is_chirpy_red"`
 	}
 
 	user_no_pass := user_token{
@@ -251,6 +352,7 @@ func (config *api_config) login_handler(writer http.ResponseWriter, request *htt
 		Email:         user_info.Email,
 		Token:         access_token,
 		Refresh_token: refresh_token,
+		IsChirpyRed:   user_info.IsChirpyRed,
 	}
 
 	respond_with_json(writer, http.StatusOK, user_no_pass)
@@ -301,6 +403,45 @@ func (config *api_config) revoke_handler(writer http.ResponseWriter, request *ht
 	}
 
 	writer.WriteHeader(204)
+}
+
+func (config *api_config) upgrade_user_handler(writer http.ResponseWriter, request *http.Request) {
+	type user_id struct {
+		UserId string `json:"user_id"`
+	}
+	type upgrade_request struct {
+		Event string  `json:"event"`
+		Data  user_id `json:"data"`
+	}
+
+	decoder := json.NewDecoder(request.Body)
+	this_upgrade_request := upgrade_request{}
+	err := decoder.Decode(&this_upgrade_request)
+	if err != nil {
+		respond_with_error(writer, http.StatusBadRequest, "malformed request", err)
+		return
+	}
+	if this_upgrade_request.Event != "user.upgraded" {
+		writer.WriteHeader(204)
+		return
+	}
+
+	uuid_user_id, err := uuid.Parse(this_upgrade_request.Data.UserId)
+
+	_, err = config.db.GetUserById(request.Context(), uuid_user_id)
+	if err != nil {
+		respond_with_error(writer, 404, "Invalid user id", err)
+		return
+	}
+
+	err = config.db.UpdateRedStatus(request.Context(), database.UpdateRedStatusParams{IsChirpyRed: true, ID: uuid_user_id})
+	if err != nil {
+		respond_with_error(writer, http.StatusInternalServerError, "Couldn't update user's status", err)
+		return
+	}
+
+	writer.WriteHeader(http.StatusNoContent)
+	return
 }
 
 func respond_with_error(writer http.ResponseWriter, code int, msg string, err error) {
@@ -357,11 +498,14 @@ func main() {
 	handler.HandleFunc("GET /api/healthz", healthHandler)
 	handler.HandleFunc("GET /api/chirps", api_config.get_all_chirps_handler)
 	handler.HandleFunc("GET /api/chirps/{chirpID}", api_config.get_chirp_handler)
+	handler.HandleFunc("DELETE /api/chirps/{chirpID}", api_config.delete_chirp_handler)
 	handler.HandleFunc("POST /api/chirps", api_config.new_chirp_handler)
 	handler.HandleFunc("POST /api/users", api_config.new_user_handler)
+	handler.HandleFunc("PUT /api/users", api_config.update_user_info_handler)
 	handler.HandleFunc("POST /api/login", api_config.login_handler)
 	handler.HandleFunc("POST /api/refresh", api_config.refresh_handler)
 	handler.HandleFunc("POST /api/revoke", api_config.revoke_handler)
+	handler.HandleFunc("POST /api/polka/webhooks", api_config.upgrade_user_handler)
 	handler.HandleFunc("GET /admin/metrics", api_config.metrics_handler)
 	handler.HandleFunc("POST /admin/reset", api_config.reset_handler)
 	server := &http.Server{
